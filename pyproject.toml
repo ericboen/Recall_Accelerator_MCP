@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recallaccelerator-mcp"
+version = "0.1.0"
+description = "RecallAccelerator MCP server: shared project memory and task tracker for Claude Code, Cursor, Codex, and other AI coding agents."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "pyodbc>=5.1.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+recallaccelerator-mcp = "recallaccelerator_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
