@@ -227,10 +227,13 @@ def complete_task(
     recommended_next_steps: str | None = None,
     warnings: str | None = None,
     follow_up_tasks: list[dict] | None = None,
+    release_id: int | None = None,
 ) -> str:
     """Mark a task done. Creates a handoff, ends the session, optionally adds follow-up tasks.
 
-    follow_up_tasks: list of dicts like {"title": "...", "description": "...", "priority": 70}
+    Args:
+        follow_up_tasks: list of dicts like {"title": "...", "description": "...", "priority": 70}
+        release_id: optional - if provided, the just-completed task is auto-attached to the named release.
     """
     body = {
         "agentSessionId": agent_session_id,
@@ -242,6 +245,15 @@ def complete_task(
         "followUpTasks": follow_up_tasks,
     }
     result = _api("POST", f"/api/agent/tasks/{task_id}/complete", body)
+
+    if release_id is not None:
+        try:
+            _api("POST", f"/api/releases/{release_id}/items",
+                 {"itemType": "task", "targetId": task_id, "addedBy": "agent (auto-tag)"})
+            result["releaseTagged"] = release_id
+        except httpx.HTTPStatusError as exc:
+            result["releaseTagError"] = f"{exc.response.status_code}: {exc.response.text[:200]}"
+
     return json.dumps(result, indent=2, default=str)
 
 
@@ -339,6 +351,120 @@ def propose_brief_update(
     }
     result = _api("POST", "/api/agent/brief-update-proposals", body)
     return f"Brief update proposal #{result.get('id')} created (status={result.get('status')})."
+
+
+# ---- Release tools (delegate to API) ---------------------------------------
+
+
+@mcp.tool()
+def list_releases(project_id: int, status: str | None = None) -> str:
+    """List releases for a project. Optional status filter: planned, in_progress, released, rolled_back."""
+    qs = f"?status={status}" if status else ""
+    rows = _api("GET", f"/api/projects/{project_id}/releases{qs}")
+    if not rows:
+        return f"No releases for project {project_id}."
+    lines = [f"{len(rows)} release(s) for project {project_id}:\n"]
+    for r in rows:
+        released = r.get("releasedAt") or "-"
+        lines.append(
+            f"  #{r['id']:>3} {r['version']:>10}  [{r['status']:>11}]  "
+            f"items={r['itemCount']}  target={r['targetEnvironment']}  released={released}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_release(release_id: int) -> str:
+    """Return full release detail including all attached items."""
+    result = _api("GET", f"/api/releases/{release_id}")
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+def get_release_changelog(release_id: int) -> str:
+    """Return the markdown changelog for a release."""
+    url = f"{API_BASE_URL}/api/releases/{release_id}/changelog"
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+        return resp.text
+
+
+@mcp.tool()
+def create_release(
+    project_id: int,
+    version: str,
+    name: str | None = None,
+    release_notes: str | None = None,
+    target_environment: str | None = None,
+) -> str:
+    """Create a planned release. Version must be unique within the project."""
+    body = {
+        "version": version,
+        "name": name,
+        "releaseNotes": release_notes,
+        "targetEnvironment": target_environment,
+    }
+    result = _api("POST", f"/api/projects/{project_id}/releases", body)
+    return f"Release #{result.get('id')} {result.get('version')} created (status={result.get('status')})."
+
+
+@mcp.tool()
+def attach_to_release(
+    release_id: int,
+    item_type: str,
+    target_id: int,
+    notes: str | None = None,
+    added_by: str | None = None,
+) -> str:
+    """Attach a task, feature, or decision to a release.
+
+    Args:
+        release_id: target release.
+        item_type: 'task' | 'feature' | 'decision'.
+        target_id: id of the task/feature/decision.
+        notes: optional note to surface in the changelog.
+        added_by: who attached it (defaults to 'system' on the API side).
+    """
+    body = {"itemType": item_type, "targetId": target_id, "notes": notes, "addedBy": added_by}
+    result = _api("POST", f"/api/releases/{release_id}/items", body)
+    return f"Attached {item_type} #{target_id} to release {release_id} as item #{result.get('id')}."
+
+
+@mcp.tool()
+def start_release(release_id: int, git_ref: str | None = None) -> str:
+    """Transition a release planned -> in_progress."""
+    result = _api("POST", f"/api/releases/{release_id}/start", {"gitRef": git_ref})
+    return f"Release {release_id} now {result.get('status')}."
+
+
+@mcp.tool()
+def complete_release(
+    release_id: int,
+    released_by: str,
+    git_ref: str | None = None,
+    deployment_artifact: str | None = None,
+    skip_brief_proposal: bool = False,
+) -> str:
+    """Mark a release as shipped. Auto-creates a brief-update proposal unless skip_brief_proposal=True."""
+    body = {
+        "releasedBy": released_by,
+        "gitRef": git_ref,
+        "deploymentArtifact": deployment_artifact,
+        "skipBriefProposal": skip_brief_proposal,
+    }
+    result = _api("POST", f"/api/releases/{release_id}/complete", body)
+    return (
+        f"Release {release_id} ({result.get('version')}) marked released by {released_by}."
+        + ("" if skip_brief_proposal else " A pending brief-update proposal was generated.")
+    )
+
+
+@mcp.tool()
+def rollback_release(release_id: int, reason: str | None = None) -> str:
+    """Mark a released release as rolled_back. Audit-only; does NOT undo the deploy."""
+    result = _api("POST", f"/api/releases/{release_id}/rollback", {"reason": reason})
+    return f"Release {release_id} now {result.get('status')}.{(' Reason: ' + reason) if reason else ''}"
 
 
 @mcp.tool()
