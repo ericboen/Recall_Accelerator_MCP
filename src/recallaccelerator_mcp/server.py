@@ -4,8 +4,10 @@ Exposes the RecallAccelerator project-memory and task-tracker over MCP so
 Claude Code, Cursor, Codex, and other AI coding agents can claim work,
 read project context, write back progress, and propose brief updates.
 
-Read tools query SQL Server directly (fast). Write tools delegate to the
-.NET API (single source of truth for state mutations).
+All tools talk to the .NET API over HTTPS (single source of truth, single
+auth path). Agent boxes need only an API key + URL - no SQL credentials,
+no ODBC driver install. Set RECALLACCELERATOR_API_URL +
+RECALLACCELERATOR_API_KEY in the per-tool MCP config block.
 """
 
 from __future__ import annotations
@@ -14,24 +16,17 @@ import json
 from typing import Any
 
 import httpx
-import pyodbc
 from fastmcp import FastMCP
 
 from .config import (
     API_BASE_URL,
     API_KEY,
     CONFIG_PATH,
-    DB_CONNECTION_STRING,
     DEFAULT_IDENTITY,
     auth_headers,
-    tbl,
 )
 
 mcp = FastMCP("RecallAccelerator")
-
-
-def _get_db():
-    return pyodbc.connect(DB_CONNECTION_STRING)
 
 
 def _api(method: str, path: str, body: dict | None = None) -> Any:
@@ -57,94 +52,59 @@ def _api(method: str, path: str, body: dict | None = None) -> Any:
             return {"raw": resp.text}
 
 
-# ---- Read tools (direct DB) ------------------------------------------------
+# ---- Read tools (delegate to API) -----------------------------------------
 
 
 @mcp.tool()
 def list_projects() -> str:
     """List all projects with id, slug, status, and current brief version."""
-    conn = _get_db()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            SELECT p.Id, p.Name, p.Slug, p.Status, p.CompactDescription,
-                   p.CurrentBriefVersionId, p.CurrentPhaseId
-            FROM {tbl('Projects')} p
-            ORDER BY p.Name
-            """
+    rows = _api("GET", "/api/projects")
+    if not rows:
+        return "No projects."
+    lines = [f"Found {len(rows)} project(s):\n"]
+    for r in rows:
+        brief = f" v{r['currentBriefVersionId']}" if r.get("currentBriefVersionId") else ""
+        desc = r.get("compactDescription") or "(no description)"
+        lines.append(
+            f"  #{r['id']:>3} {r['slug']:30} [{r['status']:8}]  {r['name']}{brief}\n"
+            f"        {desc}"
         )
-        rows = cursor.fetchall()
-        if not rows:
-            return "No projects."
-        lines = [f"Found {len(rows)} project(s):\n"]
-        for r in rows:
-            brief = f" v{r[5]}" if r[5] else ""
-            lines.append(
-                f"  #{r[0]:>3} {r[2]:30} [{r[3]:8}]  {r[1]}{brief}\n"
-                f"        {r[4] or '(no description)'}"
-            )
-        return "\n".join(lines)
-    finally:
-        conn.close()
+    return "\n".join(lines)
 
 
 @mcp.tool()
 def list_ready_tasks(project_id: int, limit: int = 20) -> str:
     """List ready (claimable) tasks for a project, ordered by priority desc."""
-    conn = _get_db()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            SELECT TOP (?) t.Id, t.Title, t.Priority, t.Description, t.AcceptanceCriteria
-            FROM {tbl('Tasks')} t
-            WHERE t.ProjectId = ? AND t.Status = 'ready'
-              AND NOT EXISTS (
-                  SELECT 1 FROM {tbl('TaskClaims')} c
-                  WHERE c.TaskId = t.Id AND c.Status = 'active' AND c.LeaseExpiresAt > SYSUTCDATETIME()
-              )
-            ORDER BY t.Priority DESC, t.CreatedAt ASC
-            """,
-            (limit, project_id),
-        )
-        rows = cursor.fetchall()
-        if not rows:
-            return f"No ready tasks for project {project_id}."
-        lines = [f"{len(rows)} ready task(s) for project {project_id}:\n"]
-        for r in rows:
-            desc = (r[3] or "").strip()
-            if desc and len(desc) > 120:
-                desc = desc[:117] + "..."
-            lines.append(f"  #{r[0]:>4} [pri {r[2]:>3}]  {r[1]}\n        {desc}")
-        return "\n".join(lines)
-    finally:
-        conn.close()
+    rows = _api("GET", f"/api/projects/{project_id}/tasks?status=ready")
+    if not rows:
+        return f"No ready tasks for project {project_id}."
+    rows = rows[:limit]
+    lines = [f"{len(rows)} ready task(s) for project {project_id}:\n"]
+    for r in rows:
+        # The list endpoint returns TaskSummaryDto which doesn't include Description.
+        # That's OK for a quick "what's available" view; full detail comes via get_task_context after claim.
+        lines.append(f"  #{r['id']:>4} [pri {r['priority']:>3}]  {r['title']}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
 def get_project_brief(project_id: int) -> str:
     """Return the current project brief markdown, or a message if none is set."""
-    conn = _get_db()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            SELECT b.VersionNumber, b.BriefMarkdown, b.CreatedBy, b.CreatedByType, b.CreatedAt
-            FROM {tbl('Projects')} p
-            JOIN {tbl('ProjectBriefVersions')} b ON b.Id = p.CurrentBriefVersionId
-            WHERE p.Id = ?
-            """,
-            (project_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
+        brief = _api("GET", f"/api/projects/{project_id}/brief")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 204:
             return f"No current brief for project {project_id}."
-        return (
-            f"# Brief v{row[0]} - by {row[2]} ({row[3]}) on {row[4]}\n\n{row[1]}"
-        )
-    finally:
-        conn.close()
+        if exc.response.status_code == 404:
+            return f"Project {project_id} not found."
+        raise
+    if not brief or not brief.get("briefMarkdown"):
+        return f"No current brief for project {project_id}."
+    return (
+        f"# Brief v{brief.get('versionNumber')} - by {brief.get('createdBy')} "
+        f"({brief.get('createdByType')}) on {brief.get('createdAt')}\n\n"
+        f"{brief['briefMarkdown']}"
+    )
 
 
 @mcp.tool()
@@ -172,27 +132,18 @@ def get_project_lineage(project_id: int) -> str:
 @mcp.tool()
 def get_project_activity(project_id: int, limit: int = 20) -> str:
     """Return recent activity events for a project."""
-    conn = _get_db()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            SELECT TOP (?) e.CreatedAt, e.EventType, e.EventSummary, e.CreatedBy, e.CreatedByType
-            FROM {tbl('ProjectEvents')} e
-            WHERE e.ProjectId = ?
-            ORDER BY e.CreatedAt DESC
-            """,
-            (limit, project_id),
+    rows = _api("GET", f"/api/projects/{project_id}/activity?limit={limit}")
+    if not rows:
+        return f"No activity for project {project_id}."
+    lines = [f"Last {len(rows)} event(s) for project {project_id}:\n"]
+    for r in rows:
+        # createdAt comes back as an ISO string; trim to minute precision for display.
+        created = (r.get("createdAt") or "")[:16].replace("T", " ")
+        lines.append(
+            f"  {created}  [{r['eventType']:25}]  {r['eventSummary']}  "
+            f"- {r.get('createdBy', '?')} ({r.get('createdByType', '?')})"
         )
-        rows = cursor.fetchall()
-        if not rows:
-            return f"No activity for project {project_id}."
-        lines = [f"Last {len(rows)} event(s) for project {project_id}:\n"]
-        for r in rows:
-            lines.append(f"  {r[0]:%Y-%m-%d %H:%M}  [{r[1]:25}]  {r[2]}  - {r[3]} ({r[4]})")
-        return "\n".join(lines)
-    finally:
-        conn.close()
+    return "\n".join(lines)
 
 
 # ---- Agent flow tools (delegate to API) -----------------------------------
@@ -577,21 +528,19 @@ def rollback_release(release_id: int, reason: str | None = None) -> str:
 
 @mcp.tool()
 def server_info() -> str:
-    """Diagnostic: return the MCP server's view of the API URL, config path, schema, identity defaults, and whether an API key is configured."""
-    db_masked = (
-        DB_CONNECTION_STRING.split(";PWD=")[0] + ";PWD=***"
-        if "PWD=" in DB_CONNECTION_STRING
-        else DB_CONNECTION_STRING
-    )
+    """Diagnostic: API URL, config path, identity defaults, and whether an API key is configured.
+
+    All tools route through the API now - no direct SQL. Agent boxes only need
+    the API key + URL.
+    """
     return (
         f"RecallAccelerator MCP\n"
         f"  config:        {CONFIG_PATH}\n"
         f"  api:           {API_BASE_URL}\n"
-        f"  api_key:       {'(set)' if API_KEY else '(not set - calls will fail when prod has Auth:RequireApiKey=true)'}\n"
+        f"  api_key:       {'(set)' if API_KEY else '(not set - required when prod has Auth:RequireApiKey=true)'}\n"
         f"  agent_name:    {DEFAULT_IDENTITY['agent_name']}\n"
         f"  tool_name:     {DEFAULT_IDENTITY['tool_name']}\n"
-        f"  claimer_kind:  {DEFAULT_IDENTITY['claimer_kind']}\n"
-        f"  db conn:       {db_masked}"
+        f"  claimer_kind:  {DEFAULT_IDENTITY['claimer_kind']}"
     )
 
 
