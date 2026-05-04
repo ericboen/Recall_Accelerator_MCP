@@ -124,12 +124,52 @@ def _resolve_schema() -> str:
     return os.environ.get("RECALLACCELERATOR_SCHEMA", DEFAULT_SCHEMA)
 
 
+def _resolve_api_key() -> str | None:
+    """Optional X-Api-Key header value. Required when prod has Auth:RequireApiKey=true."""
+    env = os.environ.get("RECALLACCELERATOR_API_KEY")
+    if env:
+        return env
+    custom = _USER_CONFIG.get("Custom") or {}
+    if isinstance(custom, dict) and custom.get("RecallAcceleratorApiKey"):
+        return custom["RecallAcceleratorApiKey"]
+    return None
+
+
+def _resolve_identity() -> dict:
+    """Default agent identity for tool calls (claim_next_task, create_*, etc.)."""
+    custom = _USER_CONFIG.get("Custom") or {}
+    return {
+        "agent_name": (
+            os.environ.get("RECALLACCELERATOR_AGENT_NAME")
+            or (custom.get("RecallAcceleratorAgentName") if isinstance(custom, dict) else None)
+            or "Agent"
+        ),
+        "tool_name": (
+            os.environ.get("RECALLACCELERATOR_TOOL_NAME")
+            or (custom.get("RecallAcceleratorToolName") if isinstance(custom, dict) else None)
+            or "unknown"
+        ),
+        "claimer_kind": (
+            os.environ.get("RECALLACCELERATOR_CLAIMER_KIND")
+            or (custom.get("RecallAcceleratorClaimerKind") if isinstance(custom, dict) else None)
+            or "ai"
+        ),
+    }
+
+
 DB_CONNECTION_STRING = _resolve_db_connection()
 API_BASE_URL = _resolve_api_url()
+API_KEY = _resolve_api_key()
 DB_SCHEMA = _resolve_schema()
 CONFIG_PATH = str(_resolve_config_path())
+DEFAULT_IDENTITY = _resolve_identity()
 
 
 def tbl(name: str) -> str:
     """Return a schema-qualified table name (e.g. dbo.Projects)."""
     return f"{DB_SCHEMA}.{name}"
+
+
+def auth_headers() -> dict:
+    """Build the auth header dict for HTTP calls. Empty when no API key configured."""
+    return {"X-Api-Key": API_KEY} if API_KEY else {}

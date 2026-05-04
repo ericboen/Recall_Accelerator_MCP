@@ -17,7 +17,15 @@ import httpx
 import pyodbc
 from fastmcp import FastMCP
 
-from .config import API_BASE_URL, CONFIG_PATH, DB_CONNECTION_STRING, tbl
+from .config import (
+    API_BASE_URL,
+    API_KEY,
+    CONFIG_PATH,
+    DB_CONNECTION_STRING,
+    DEFAULT_IDENTITY,
+    auth_headers,
+    tbl,
+)
 
 mcp = FastMCP("RecallAccelerator")
 
@@ -28,11 +36,16 @@ def _get_db():
 
 def _api(method: str, path: str, body: dict | None = None) -> Any:
     url = f"{API_BASE_URL}{path}"
-    with httpx.Client(timeout=60.0) as client:
+    headers = auth_headers()
+    with httpx.Client(timeout=60.0, headers=headers) as client:
         if method == "GET":
             resp = client.get(url)
         elif method == "POST":
             resp = client.post(url, json=body or {})
+        elif method == "PUT":
+            resp = client.put(url, json=body or {})
+        elif method == "DELETE":
+            resp = client.delete(url)
         else:
             raise ValueError(f"Unsupported method: {method}")
         resp.raise_for_status()
@@ -188,11 +201,16 @@ def get_project_activity(project_id: int, limit: int = 20) -> str:
 @mcp.tool()
 def claim_next_task(
     project_id: int,
-    agent_name: str = "Claude Code",
-    tool_name: str = "claude-code",
+    agent_name: str | None = None,
+    tool_name: str | None = None,
     capabilities: list[str] | None = None,
+    claimer_kind: str | None = None,
 ) -> str:
     """Claim the highest-priority ready task on a project. Atomic.
+
+    Identity defaults come from env vars (RECALLACCELERATOR_AGENT_NAME,
+    RECALLACCELERATOR_TOOL_NAME, RECALLACCELERATOR_CLAIMER_KIND) so callers
+    don't have to repeat them. Pass them explicitly to override.
 
     Returns the agent_session_id, task_id, and full agent context (project,
     brief, lineage, decisions, related notes, previous handoffs, writeback
@@ -200,9 +218,10 @@ def claim_next_task(
     """
     body = {
         "projectId": project_id,
-        "agentName": agent_name,
-        "toolName": tool_name,
+        "agentName": agent_name or DEFAULT_IDENTITY["agent_name"],
+        "toolName": tool_name or DEFAULT_IDENTITY["tool_name"],
         "capabilities": capabilities or [],
+        "claimerKind": claimer_kind or DEFAULT_IDENTITY["claimer_kind"],
     }
     result = _api("POST", "/api/agent/tasks/claim-next", body)
     if "agentSessionId" not in result:
@@ -353,6 +372,95 @@ def propose_brief_update(
     return f"Brief update proposal #{result.get('id')} created (status={result.get('status')})."
 
 
+# ---- Bootstrap tools (cold-start a new project from agent context) ---------
+
+
+@mcp.tool()
+def create_workspace(name: str, description: str | None = None) -> str:
+    """Create a new workspace (top-level container for projects). Use sparingly - usually you want one workspace per user."""
+    result = _api("POST", "/api/workspaces", {"name": name, "description": description})
+    return f"Workspace #{result.get('id')} '{result.get('name')}' created."
+
+
+@mcp.tool()
+def create_project(
+    workspace_id: int,
+    name: str,
+    slug: str,
+    compact_description: str | None = None,
+    goal: str | None = None,
+    current_scope: str | None = None,
+    repo_url: str | None = None,
+) -> str:
+    """Create a new project under a workspace. Slug must be unique across all projects."""
+    body = {
+        "workspaceId": workspace_id,
+        "name": name,
+        "slug": slug,
+        "compactDescription": compact_description,
+        "goal": goal,
+        "currentScope": current_scope,
+        "repoUrl": repo_url,
+    }
+    result = _api("POST", "/api/projects", body)
+    return f"Project #{result.get('id')} '{result.get('name')}' (slug: {result.get('slug')}) created."
+
+
+@mcp.tool()
+def create_brief_version(
+    project_id: int,
+    brief_markdown: str,
+    change_summary: str | None = None,
+    created_by: str | None = None,
+) -> str:
+    """Create the next brief version for a project (becomes the current brief).
+
+    Use at project bootstrap to seed the initial brief. For subsequent updates,
+    prefer propose_brief_update so a human can curate.
+    """
+    body = {
+        "briefMarkdown": brief_markdown,
+        "createdBy": created_by or DEFAULT_IDENTITY["agent_name"],
+        "createdByType": "agent",
+        "changeSummary": change_summary,
+    }
+    result = _api("POST", f"/api/projects/{project_id}/brief/versions", body)
+    return f"Brief version #{result.get('id')} (v{result.get('versionNumber')}) created and set as current."
+
+
+@mcp.tool()
+def create_task(
+    project_id: int,
+    title: str,
+    description: str | None = None,
+    agent_instructions: str | None = None,
+    acceptance_criteria: str | None = None,
+    kind: str = "either",
+    priority: int = 50,
+    status: str = "ready",
+    feature_id: int | None = None,
+    phase_id: int | None = None,
+) -> str:
+    """Create a task on a project. kind: 'agent_only' | 'human_only' | 'either'.
+
+    Status defaults to 'ready' so the task is immediately claimable. Use 'backlog'
+    if you're capturing work that's not yet refined enough to assign.
+    """
+    body = {
+        "title": title,
+        "description": description,
+        "agentInstructions": agent_instructions,
+        "acceptanceCriteria": acceptance_criteria,
+        "kind": kind,
+        "priority": priority,
+        "status": status,
+        "featureId": feature_id,
+        "phaseId": phase_id,
+    }
+    result = _api("POST", f"/api/projects/{project_id}/tasks", body)
+    return f"Task #{result.get('id')} '{result.get('title')}' created (status: {result.get('status')}, kind: {result.get('kind')})."
+
+
 # ---- Release tools (delegate to API) ---------------------------------------
 
 
@@ -469,12 +577,21 @@ def rollback_release(release_id: int, reason: str | None = None) -> str:
 
 @mcp.tool()
 def server_info() -> str:
-    """Diagnostic: return the MCP server's view of the API URL, config path, and schema."""
+    """Diagnostic: return the MCP server's view of the API URL, config path, schema, identity defaults, and whether an API key is configured."""
+    db_masked = (
+        DB_CONNECTION_STRING.split(";PWD=")[0] + ";PWD=***"
+        if "PWD=" in DB_CONNECTION_STRING
+        else DB_CONNECTION_STRING
+    )
     return (
         f"RecallAccelerator MCP\n"
-        f"  config:  {CONFIG_PATH}\n"
-        f"  api:     {API_BASE_URL}\n"
-        f"  db conn: {DB_CONNECTION_STRING.split(';PWD=')[0]};PWD=***"
+        f"  config:        {CONFIG_PATH}\n"
+        f"  api:           {API_BASE_URL}\n"
+        f"  api_key:       {'(set)' if API_KEY else '(not set - calls will fail when prod has Auth:RequireApiKey=true)'}\n"
+        f"  agent_name:    {DEFAULT_IDENTITY['agent_name']}\n"
+        f"  tool_name:     {DEFAULT_IDENTITY['tool_name']}\n"
+        f"  claimer_kind:  {DEFAULT_IDENTITY['claimer_kind']}\n"
+        f"  db conn:       {db_masked}"
     )
 
 
