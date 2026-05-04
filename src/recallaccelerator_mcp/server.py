@@ -181,6 +181,36 @@ def claim_next_task(
 
 
 @mcp.tool()
+def claim_specific_task(
+    task_id: int,
+    agent_name: str | None = None,
+    tool_name: str | None = None,
+    capabilities: list[str] | None = None,
+    claimer_kind: str | None = None,
+) -> str:
+    """Claim a SPECIFIC task by id (vs claim_next_task which always picks the highest-priority).
+
+    Useful for backfill bookkeeping when you want to close out a specific task
+    that's blocked behind a higher-priority one in the queue, or when an agent
+    knows exactly which task they want to work on next. Atomic with the same
+    guarantees as claim_next_task. Returns null if the task isn't ready,
+    already claimed, or its kind doesn't match the claimer.
+
+    Identity defaults come from env vars (RECALLACCELERATOR_AGENT_NAME,
+    RECALLACCELERATOR_TOOL_NAME, RECALLACCELERATOR_CLAIMER_KIND).
+    """
+    body = {
+        "projectId": 0,  # the API endpoint resolves the project from the task automatically
+        "agentName": agent_name or DEFAULT_IDENTITY["agent_name"],
+        "toolName": tool_name or DEFAULT_IDENTITY["tool_name"],
+        "capabilities": capabilities or [],
+        "claimerKind": claimer_kind or DEFAULT_IDENTITY["claimer_kind"],
+    }
+    result = _api("POST", f"/api/agent/tasks/{task_id}/claim", body)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
 def get_task_context(task_id: int, agent_session_id: int) -> str:
     """Return the full agent context for a task (project, brief, lineage, decisions, notes, handoffs)."""
     result = _api("GET", f"/api/agent/tasks/{task_id}/context?agentSessionId={agent_session_id}")
