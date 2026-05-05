@@ -267,10 +267,20 @@ def release_task(task_id: int, agent_session_id: int, reason: str | None = None)
 
 @mcp.tool()
 def heartbeat_session(session_id: int, lease_extension_minutes: int | None = None) -> str:
-    """Send a heartbeat to extend the lease on the active claim."""
+    """Send a heartbeat to extend the lease on the active claim.
+
+    Returns the new expiry time and seconds remaining so callers (and humans
+    reading the trace) can decide whether to schedule the next heartbeat sooner.
+    Default AI lease is 30 minutes; default human lease is 7 days.
+    """
     body = {"leaseExtensionMinutes": lease_extension_minutes}
     result = _api("POST", f"/api/agent/sessions/{session_id}/heartbeat", body)
-    return f"Lease extended to {result.get('leaseExpiresAt', 'unknown')}."
+    expiry = result.get("leaseExpiresAt", "unknown")
+    secs = result.get("timeUntilExpirySeconds")
+    if secs is None:
+        return f"Lease extended to {expiry}."
+    minutes = secs // 60
+    return f"Lease extended to {expiry} ({minutes} min / {secs}s remaining)."
 
 
 @mcp.tool()
@@ -329,6 +339,39 @@ def add_decision(
     }
     result = _api("POST", "/api/agent/decisions", body)
     return f"Decision #{result.get('id')} created: {title}"
+
+
+@mcp.tool()
+def propose_task(
+    project_id: int,
+    title: str,
+    context: str | None = None,
+    suggested_priority: int | None = None,
+    source: str | None = None,
+    agent_session_id: int | None = None,
+) -> str:
+    """Throw a half-formed task suggestion into the project's Pending Proposals bucket.
+
+    Prefer this over create_task when you're surfacing follow-up work the human hasn't
+    asked for yet — proposals don't pollute the ready queue and the human triages from
+    /Proposals (or /Triage). create_task is for work that's already approved.
+
+    title is required; everything else is optional. agent_session_id is automatically
+    associated with whatever session you're in if you pass it.
+    """
+    body = {
+        "projectId": project_id,
+        "title": title,
+        "context": context,
+        "suggestedPriority": suggested_priority,
+        "source": source or DEFAULT_IDENTITY["tool_name"],
+        "agentSessionId": agent_session_id,
+    }
+    result = _api("POST", "/api/agent/proposals", body)
+    return (
+        f"Proposal #{result.get('id')} pending: {result.get('title')}"
+        + (f" (suggested priority: {result.get('suggestedPriority')})" if result.get('suggestedPriority') is not None else "")
+    )
 
 
 @mcp.tool()
