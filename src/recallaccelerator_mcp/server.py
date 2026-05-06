@@ -416,7 +416,13 @@ def create_project(
     current_scope: str | None = None,
     repo_url: str | None = None,
 ) -> str:
-    """Create a new project under a workspace. Slug must be unique across all projects."""
+    """Create a new project under a workspace. Slug must be unique across all projects.
+
+    Phase 2 onboarding (#49): the response now includes ready-to-drop per-repo agent
+    files (CLAUDE.md, AGENTS.md, .cursorrules) with the new project's slug, project_id,
+    instance URL and repo URL pre-substituted. Surface them to the user so they can
+    paste at the repo root — no manual editing needed.
+    """
     body = {
         "workspaceId": workspace_id,
         "name": name,
@@ -427,7 +433,57 @@ def create_project(
         "repoUrl": repo_url,
     }
     result = _api("POST", "/api/projects", body)
-    return f"Project #{result.get('id')} '{result.get('name')}' (slug: {result.get('slug')}) created."
+    project_id = result.get("id")
+    project_name = result.get("name")
+    project_slug = result.get("slug")
+
+    summary = (
+        f"Project #{project_id} '{project_name}' (slug: {project_slug}) created.\n\n"
+        "Per-repo agent files have been generated and are ready to drop at the repo root:\n"
+        "  - CLAUDE.md      (Claude Code)\n"
+        "  - AGENTS.md      (Codex / cross-tool)\n"
+        "  - .cursorrules   (Cursor)\n\n"
+        f"Fetch the contents with get_project_agent_files({project_id}), then show them to "
+        "the user with the instructions where to drop each file. Pick whichever matches "
+        "the user's tool — multiple is fine."
+    )
+
+    # If the API actually included the files inline (it does), include the keys for the
+    # agent's awareness without dumping the whole payload into the chat.
+    files = (result.get("agentFiles") or {}).get("files") or {}
+    if files:
+        summary += f"\n\nThe response payload also embedded the file contents directly under .agentFiles.files: {sorted(files.keys())}."
+    return summary
+
+
+@mcp.tool()
+def get_project_agent_files(project_id: int, tool: str | None = None) -> str:
+    """Fetch the per-repo agent instruction file(s) for an existing project.
+
+    Phase 2 onboarding (#49): drop these at the repo root so a fresh agent in a new
+    clone can find its way back to the right RA project (slug, project_id, instance
+    URL all pre-filled).
+
+    Without `tool`, returns all three files (CLAUDE.md / AGENTS.md / .cursorrules).
+    With `tool` set to one of {claude-code, codex, cursor}, returns just that file.
+
+    Use this for retrofit on projects that pre-date the Phase 2 work, or when the
+    user has lost their original copy.
+    """
+    if tool:
+        result = _api("GET", f"/api/projects/{project_id}/agent-files?tool={tool}")
+        file_name = result.get("file")
+        content = result.get("content") or ""
+        return f"--- {file_name} ---\n{content}"
+
+    result = _api("GET", f"/api/projects/{project_id}/agent-files")
+    files = result.get("files") or {}
+    instructions = result.get("instructions") or ""
+    parts = [f"Instructions: {instructions}"]
+    for name in ("CLAUDE.md", "AGENTS.md", ".cursorrules"):
+        if name in files:
+            parts.append(f"\n--- {name} ---\n{files[name]}")
+    return "\n".join(parts)
 
 
 @mcp.tool()
