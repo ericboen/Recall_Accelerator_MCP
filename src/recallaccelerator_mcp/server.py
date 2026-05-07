@@ -409,6 +409,67 @@ def create_workspace(name: str, description: str | None = None) -> str:
 
 
 @mcp.tool()
+def list_future_projects(workspace_id: int) -> str:
+    """List 'future-idea' projects in a workspace — the parking lot for ideas
+    that haven't earned a real project yet (#42).
+
+    Future-ideas don't show up on the dashboard or in default /Projects lists.
+    They live at /Ideas and get promoted to active projects via the UI when
+    they mature into something worth tracking. Use this MCP tool to discover
+    what ideas are sitting parked.
+    """
+    # The list_projects API endpoint returns ALL statuses; filter client-side.
+    result = _api("GET", f"/api/projects?workspaceId={workspace_id}")
+    if not isinstance(result, list):
+        return "Unexpected response shape from /api/projects."
+    ideas = [p for p in result if p.get("status") == "future_idea"]
+    if not ideas:
+        return f"No future-idea projects in workspace {workspace_id}."
+    lines = [f"{len(ideas)} future-idea project(s) in workspace {workspace_id}:\n"]
+    for p in ideas:
+        desc = p.get("compactDescription") or "(no description)"
+        lines.append(f"  #{p.get('id'):>3} [{p.get('slug')}]  {p.get('name')} — {desc}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def create_idea(
+    workspace_id: int,
+    name: str,
+    slug: str,
+    compact_description: str | None = None,
+    goal: str | None = None,
+    repo_url: str | None = None,
+) -> str:
+    """Park a future-project idea (#42). Same data shape as create_project but
+    the result lands in the /Ideas parking lot with status='future_idea',
+    hidden from the dashboard and default /Projects view until the human
+    promotes it.
+
+    Use this when you (the agent) discover a half-formed idea worth capturing
+    but the user hasn't committed to making it a real project. The human
+    promotes via /Ideas → "Promote to active project" when it matures.
+
+    Slug must still be unique across all projects (active + idea + archived).
+    """
+    body = {
+        "workspaceId": workspace_id,
+        "name": name,
+        "slug": slug,
+        "compactDescription": compact_description,
+        "goal": goal,
+        "currentScope": None,
+        "repoUrl": repo_url,
+        "status": "future_idea",
+    }
+    result = _api("POST", "/api/projects", body)
+    return (
+        f"Future-idea #{result.get('id')} '{result.get('name')}' (slug: {result.get('slug')}) parked. "
+        f"Visible at /Ideas. Human can promote when ready."
+    )
+
+
+@mcp.tool()
 def create_project(
     workspace_id: int,
     name: str,
