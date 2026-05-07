@@ -39,6 +39,8 @@ def _api(method: str, path: str, body: dict | None = None) -> Any:
             resp = client.post(url, json=body or {})
         elif method == "PUT":
             resp = client.put(url, json=body or {})
+        elif method == "PATCH":
+            resp = client.patch(url, json=body or {})
         elif method == "DELETE":
             resp = client.delete(url)
         else:
@@ -484,6 +486,51 @@ def get_project_agent_files(project_id: int, tool: str | None = None) -> str:
         if name in files:
             parts.append(f"\n--- {name} ---\n{files[name]}")
     return "\n".join(parts)
+
+
+@mcp.tool()
+def update_task(
+    task_id: int,
+    title: str | None = None,
+    description: str | None = None,
+    agent_instructions: str | None = None,
+    acceptance_criteria: str | None = None,
+    priority: int | None = None,
+    kind: str | None = None,
+    status: str | None = None,
+    phase_id: int | None = None,
+    feature_id: int | None = None,
+) -> str:
+    """Update fields on an existing task. Sparse: any unspecified field is left alone.
+
+    Use this to reprioritize, fix typos, evolve descriptions as understanding grows,
+    or change the kind (agent_only ↔ either) when scope shifts. Each changed field
+    writes one row to TaskAuditLog so the change history is queryable.
+
+    Constraints:
+    - Tasks with an active claim are rejected (409). Release first if you need to mutate.
+    - status here is limited to backlog | ready | blocked. Use complete_task for done;
+      release_task to drop a claim.
+    - priority is clamped 0-100.
+    - kind must be one of agent_only | human_only | either.
+    """
+    body: dict[str, object | None] = {}
+    if title is not None: body["title"] = title
+    if description is not None: body["description"] = description
+    if agent_instructions is not None: body["agentInstructions"] = agent_instructions
+    if acceptance_criteria is not None: body["acceptanceCriteria"] = acceptance_criteria
+    if priority is not None: body["priority"] = priority
+    if kind is not None: body["kind"] = kind
+    if status is not None: body["status"] = status
+    if phase_id is not None: body["phaseId"] = phase_id
+    if feature_id is not None: body["featureId"] = feature_id
+
+    if not body:
+        return "No fields supplied — nothing to update."
+
+    result = _api("PATCH", f"/api/tasks/{task_id}", body)
+    changed = ", ".join(body.keys())
+    return f"Task #{result.get('id')} '{result.get('title')}' updated. Fields changed: {changed}."
 
 
 @mcp.tool()
