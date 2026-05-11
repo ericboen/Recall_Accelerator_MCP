@@ -344,6 +344,57 @@ def add_decision(
 
 
 @mcp.tool()
+def quick_capture_idea(
+    project_id: int,
+    content: str,
+    source: str | None = None,
+) -> str:
+    """Lightning-fast idea capture for a project. No session required — drop and run.
+
+    Use this for the "wait, what was that thing?" moments mid-conversation. The capture
+    creates a ContextNote with note_type='idea' and waits in the project until someone
+    calls `synthesize_ideas_to_tasks` (or clicks the button on /Projects/Detail), at
+    which point the LLM batches the unsynthesized ideas into structured TaskProposals
+    that land at /Triage.
+
+    Prefer this over `add_context_note(..., note_type='idea')` when you don't have an
+    active agent session — capture should not require a claim.
+    """
+    body = {
+        "content": content,
+        "source": source or DEFAULT_IDENTITY["tool_name"],
+        "createdBy": DEFAULT_IDENTITY["agent_name"],
+    }
+    result = _api("POST", f"/api/projects/{project_id}/ideas", body)
+    return f"Idea note #{result.get('id')} captured for project {project_id}."
+
+
+@mcp.tool()
+def synthesize_ideas_to_tasks(project_id: int) -> str:
+    """Ask the LLM to turn this project's unsynthesized idea-notes into structured task proposals.
+
+    The resulting proposals land at /Triage as 'pending' — the human triages them into real
+    ready tasks (or rejects them). Notes consumed during synthesis are marked so they don't
+    get re-processed on the next call.
+
+    If the RA instance has no Anthropic API key configured, returns guidance for adding the
+    `anthropic_api_key` credential (env var override `Anthropic__ApiKey`) at /Credentials.
+    """
+    result = _api("POST", f"/api/projects/{project_id}/ideas/synthesize", {})
+    if result.get("llmDisabled"):
+        msg = result.get("message") or "LLM not configured."
+        return f"Synthesis skipped — {msg}"
+    n = result.get("ideasProcessed", 0)
+    m = result.get("proposalsCreated", 0)
+    if n == 0:
+        return f"No unsynthesized ideas to process on project {project_id}."
+    return (
+        f"Synthesized {n} idea(s) into {m} task proposal(s). "
+        f"Triage at /Triage. Proposal IDs: {result.get('proposalIds', [])}."
+    )
+
+
+@mcp.tool()
 def propose_task(
     project_id: int,
     title: str,
