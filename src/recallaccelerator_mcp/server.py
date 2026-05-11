@@ -763,6 +763,112 @@ def rollback_release(release_id: int, reason: str | None = None) -> str:
     return f"Release {release_id} now {result.get('status')}.{(' Reason: ' + reason) if reason else ''}"
 
 
+# ---- Credentials (METADATA ONLY — values flow through the racred CLI) ----------
+#
+# Decision #27 invariant: the LLM chat session never sees a credential value.
+# The MCP intentionally has NO tool that returns cleartext. If you find yourself
+# wanting one, that's a sign to use racred from the agent's bash tool instead
+# (e.g. `racred run -- gh repo list` injects the value into the child process,
+# never into your context). Adding a value-returning MCP tool would silently
+# bypass the entire security boundary this server was designed around.
+
+
+@mcp.tool()
+def list_credentials(project_id: int, category: str | None = None) -> str:
+    """List credentials visible to a project — its own + every global. METADATA ONLY.
+
+    Returns names, categories, env-var mappings, descriptions, and disabled status.
+    To actually read a value, run `racred get <name>` from a shell inside the
+    project repo, or `racred run -- <command>` to inject creds into a child
+    process's environment.
+
+    Args:
+        project_id: The project to scope the listing to. Globals (ProjectId IS NULL)
+            are always included; project-scoped creds appear only for THIS project.
+        category: Optional filter (e.g. "database", "api", "ftp"). Free-form string —
+            matches exactly, case-sensitive.
+    """
+    qs = f"?category={category}" if category else ""
+    rows = _api("GET", f"/api/projects/{project_id}/credentials{qs}")
+    if not rows:
+        return f"No credentials visible from project {project_id}."
+
+    # Group by (scope, category) so the agent gets a clean overview rather than a flat list.
+    globals_, scoped = [], []
+    for r in rows:
+        (globals_ if r.get("projectId") is None else scoped).append(r)
+
+    def _fmt(rows_: list) -> list[str]:
+        out = []
+        by_cat: dict[str, list] = {}
+        for r in rows_:
+            by_cat.setdefault(r.get("category") or "(uncategorized)", []).append(r)
+        for cat in sorted(by_cat):
+            out.append(f"  [{cat}]")
+            for r in by_cat[cat]:
+                disabled = " [DISABLED]" if r.get("isDisabled") else ""
+                env = r.get("envVar") or r["name"].upper()
+                desc = f" — {r['description']}" if r.get("description") else ""
+                out.append(f"    {r['name']:30} → ${env}{disabled}{desc}")
+        return out
+
+    lines = [f"Credentials visible to project {project_id} ({len(rows)} total):\n"]
+    if globals_:
+        lines.append(f"Global ({len(globals_)}):")
+        lines.extend(_fmt(globals_))
+        lines.append("")
+    if scoped:
+        lines.append(f"Project-scoped ({len(scoped)}):")
+        lines.extend(_fmt(scoped))
+    lines.append("")
+    lines.append("To fetch a value: `racred get <name>` (from a shell inside the project repo).")
+    lines.append("To inject into a command: `racred run -- <command>` (e.g. `racred run -- gh repo list`).")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def describe_credential(project_id: int, name: str) -> str:
+    """Resolve a credential by name within a project's scope and return its metadata.
+
+    Project-scoped wins over global with the same name. Useful when you need to
+    confirm a cred exists, see its env-var mapping, or check whether it's been
+    disabled — BEFORE telling the user to run `racred get` and finding out it
+    doesn't exist.
+
+    Returns metadata only. Never the value.
+    """
+    rows = _api("GET", f"/api/projects/{project_id}/credentials")
+    if not isinstance(rows, list):
+        return "Unexpected response from /api/projects/{id}/credentials."
+
+    matches = [r for r in rows if r.get("name") == name]
+    if not matches:
+        return (
+            f"No credential named '{name}' visible from project {project_id}. "
+            f"Use list_credentials to see what's available, or ask the user to add one via /Credentials."
+        )
+
+    # Precedence: project-scoped > global. The list returns globals first, but to be
+    # explicit, prefer the row whose projectId matches.
+    project_scoped = [r for r in matches if r.get("projectId") == project_id]
+    chosen = project_scoped[0] if project_scoped else matches[0]
+
+    scope = "project-scoped" if chosen.get("projectId") is not None else "global"
+    env = chosen.get("envVar") or chosen["name"].upper()
+    parts = [
+        f"Credential '{chosen['name']}':",
+        f"  scope:        {scope}" + (f" (project {chosen.get('projectId')})" if chosen.get("projectId") else ""),
+        f"  category:     {chosen.get('category') or '(uncategorized)'}",
+        f"  env var:      ${env}",
+        f"  description:  {chosen.get('description') or '(none)'}",
+        f"  status:       {'DISABLED — ' + (chosen.get('disabledReason') or 'no reason given') if chosen.get('isDisabled') else 'active'}",
+        f"  updated:      {chosen.get('updatedAt')}",
+        "",
+        f"To fetch the value: `racred get {chosen['name']}` (from project repo)",
+    ]
+    return "\n".join(parts)
+
+
 @mcp.tool()
 def server_info() -> str:
     """Diagnostic: API URL, config path, identity defaults, and whether an API key is configured.
