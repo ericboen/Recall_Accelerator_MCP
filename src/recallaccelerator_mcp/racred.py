@@ -253,13 +253,19 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _stderr(f"racred: injected {fetched} credential(s) into env for '{cmd_base}'.")
 
-    # 3. Exec. On POSIX we use os.execvpe to replace the current process; on Windows
-    #    that's not actually replacing, but it's still the cleanest way to chain.
+    # 3. Spawn the child with the augmented env and wait for it. We used to use
+    #    os.execvpe to replace the racred process (no extra layer in the process
+    #    tree), but on Windows / Git Bash MSYS that path segfaults when execvpe
+    #    targets a native Windows .exe. subprocess.run uses CreateProcess under
+    #    the hood on Windows and Popen on POSIX, which works reliably for both.
+    #    Cost: one extra process node in the tree. Worth it for portability.
+    import subprocess
     try:
-        os.execvpe(cmd_path, args.command, env)
+        result = subprocess.run(args.command, env=env)
+        return result.returncode
     except FileNotFoundError:
         _die(f"racred: command not found: {cmd_path}", code=127)
-    return 0  # unreachable on success
+    return 0  # unreachable on FileNotFoundError path
 
 
 def cmd_whoami(args: argparse.Namespace) -> int:
