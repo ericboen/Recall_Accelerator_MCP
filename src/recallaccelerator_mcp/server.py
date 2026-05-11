@@ -287,10 +287,64 @@ def heartbeat_session(session_id: int, lease_extension_minutes: int | None = Non
 
 @mcp.tool()
 def end_session(session_id: int, summary: str | None = None) -> str:
-    """End an agent session. Use when wrapping up without completing the active task."""
+    """End an agent session. Use when wrapping up without completing the active task.
+
+    Note: as of v0.10.0 this auto-fires a SessionReconciliation if the session produced
+    any side-output (proposals, notes, decisions). For an explicit summary the human
+    sees on /Triage, prefer `end_session_with_reconciliation` and pass an
+    `agent_closing_note`.
+    """
     body = {"summary": summary}
     _api("POST", f"/api/agent/sessions/{session_id}/end", body)
     return f"Session {session_id} ended."
+
+
+@mcp.tool()
+def end_session_with_reconciliation(
+    session_id: int,
+    agent_closing_note: str | None = None,
+) -> str:
+    """End an agent session AND return a reconciliation envelope summarizing the
+    session's side-output (task #40).
+
+    Prefer this over plain `end_session` when wrapping up a session that produced
+    proposals, ideas, decisions, or context notes — the reconciliation lands on
+    /Triage as a "what the agent saw but you might miss" record the human reviews.
+
+    Pass `agent_closing_note` with a short prose summary the human reads on top of
+    the auto-built footprint (e.g. "I left two TODOs in src/foo.cs — they need
+    domain decisions before I can wire them up").
+
+    Idempotent: a second call on an already-ended session returns the existing
+    reconciliation row.
+
+    Note: `complete_task` already auto-fires a reconciliation. Use this tool when
+    the session is ending WITHOUT completing the active claim (release path,
+    or an exploratory session that won't finish a task), or when you want to
+    attach an explicit closing note that complete_task didn't carry.
+    """
+    body = {"agentClosingNote": agent_closing_note}
+    result = _api("POST", f"/api/agent/sessions/{session_id}/end-with-reconciliation", body)
+
+    status = result.get("status")
+    if status == "skipped_empty":
+        return (
+            f"Session {session_id} ended. No reconciliation written — the session produced "
+            f"no tracked side-output (no proposals, notes, decisions, or ideas) and no closing "
+            f"note was provided. Nothing for the human to triage."
+        )
+
+    counts = (
+        f"{result.get('proposalsFiled', 0)} proposal(s), "
+        f"{result.get('ideasCaptured', 0)} idea(s), "
+        f"{result.get('decisionsRecorded', 0)} decision(s), "
+        f"{result.get('contextNotesAdded', 0)} note(s), "
+        f"{result.get('tasksCompleted', 0)} task(s) completed"
+    )
+    return (
+        f"Session {session_id} ended. Reconciliation #{result.get('id')} written "
+        f"(status: {status}). Footprint: {counts}. Triage at /Triage."
+    )
 
 
 @mcp.tool()
