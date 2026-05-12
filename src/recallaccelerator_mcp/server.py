@@ -440,6 +440,12 @@ def synthesize_ideas_to_tasks(project_id: int) -> str:
         return f"Synthesis skipped — {msg}"
     n = result.get("ideasProcessed", 0)
     m = result.get("proposalsCreated", 0)
+    # Task #85: the API now distinguishes "LLM call failed after retries" (ideasProcessed=0
+    # WITH a message) from "no unsynthesized ideas to process" (ideasProcessed=0 with no
+    # message or a different message). Surface the API message verbatim in the failure case.
+    server_msg = result.get("message")
+    if n == 0 and server_msg and "unavailable" in server_msg.lower():
+        return f"Synthesis failed (notes preserved for retry): {server_msg}"
     if n == 0:
         return f"No unsynthesized ideas to process on project {project_id}."
     return (
