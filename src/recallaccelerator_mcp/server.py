@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 
+from .api_client import RaApiError, api_call
 from .config import (
     API_BASE_URL,
     API_KEY,
@@ -29,29 +30,20 @@ from .config import (
 mcp = FastMCP("RecallAccelerator")
 
 
-def _api(method: str, path: str, body: dict | None = None) -> Any:
-    url = f"{API_BASE_URL}{path}"
-    headers = auth_headers()
-    with httpx.Client(timeout=60.0, headers=headers) as client:
-        if method == "GET":
-            resp = client.get(url)
-        elif method == "POST":
-            resp = client.post(url, json=body or {})
-        elif method == "PUT":
-            resp = client.put(url, json=body or {})
-        elif method == "PATCH":
-            resp = client.patch(url, json=body or {})
-        elif method == "DELETE":
-            resp = client.delete(url)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        resp.raise_for_status()
-        if not resp.content:
-            return {}
-        try:
-            return resp.json()
-        except json.JSONDecodeError:
-            return {"raw": resp.text}
+def _api(method: str, path: str, body: dict | None = None, *, max_retries: int | None = None) -> Any:
+    """Thin wrapper around api_client.api_call that builds the URL + auth headers.
+
+    v0.17.2 (tasks #145 + #146): retries + structured errors come from the
+    shared api_client module. See api_client.py for the retry policy and
+    RaApiError shape.
+    """
+    return api_call(
+        method,
+        f"{API_BASE_URL}{path}",
+        json_body=body,
+        headers=auth_headers(),
+        max_retries=max_retries,
+    )
 
 
 # ---- Read tools (delegate to API) -----------------------------------------
@@ -94,10 +86,13 @@ def get_project_brief(project_id: int) -> str:
     """Return the current project brief markdown, or a message if none is set."""
     try:
         brief = _api("GET", f"/api/projects/{project_id}/brief")
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 204:
+    except RaApiError as exc:
+        # v0.17.2 (#145): use the structured error's http_status field instead of the
+        # old httpx.HTTPStatusError shape. 204 doesn't raise (raise_for_status only
+        # raises 4xx/5xx) so it's not reachable here, but kept for paranoia.
+        if exc.http_status == 204:
             return f"No current brief for project {project_id}."
-        if exc.response.status_code == 404:
+        if exc.http_status == 404:
             return f"Project {project_id} not found."
         raise
     if not brief or not brief.get("briefMarkdown"):
@@ -253,8 +248,13 @@ def complete_task(
             _api("POST", f"/api/releases/{release_id}/items",
                  {"itemType": "task", "targetId": task_id, "addedBy": "agent (auto-tag)"})
             result["releaseTagged"] = release_id
-        except httpx.HTTPStatusError as exc:
-            result["releaseTagError"] = f"{exc.response.status_code}: {exc.response.text[:200]}"
+        except RaApiError as exc:
+            # v0.17.2 (#145): structured error. Surface http_status + body if present
+            # so the caller can see why the release tag failed (often 409 if the item
+            # is already attached or the release is in a terminal state).
+            status = exc.http_status if exc.http_status is not None else "?"
+            body = (exc.response_body or "")[:200]
+            result["releaseTagError"] = f"{status}: {body}"
 
     return json.dumps(result, indent=2, default=str)
 
@@ -790,11 +790,16 @@ def get_release(release_id: int) -> str:
 @mcp.tool()
 def get_release_changelog(release_id: int) -> str:
     """Return the markdown changelog for a release."""
-    url = f"{API_BASE_URL}/api/releases/{release_id}/changelog"
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        return resp.text
+    # v0.17.2 (#145+#146): route through the shared client so this read also gets
+    # transient-error retries + structured errors. expect_json=False because the
+    # changelog endpoint returns text/markdown, not JSON.
+    return api_call(
+        "GET",
+        f"{API_BASE_URL}/api/releases/{release_id}/changelog",
+        headers=auth_headers(),
+        timeout=30.0,
+        expect_json=False,
+    )
 
 
 @mcp.tool()
