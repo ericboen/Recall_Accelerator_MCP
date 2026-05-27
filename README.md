@@ -8,6 +8,21 @@ This package is the thin client layer. The server logic lives in the main Recall
 
 You need Python 3.11+ and a RecallAccelerator instance you can reach over HTTPS (run your own — see the [main repo](https://github.com/ericboen/RecallAccelerator) — or use someone else's).
 
+### macOS / Linux
+
+```bash
+git clone https://github.com/ericboen/Recall_Accelerator_MCP.git
+cd Recall_Accelerator_MCP
+# Make sure python3 is version 3.11+ (use python3.11 if python3 is older)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+This installs the `recallaccelerator-mcp` and `racred` launchers inside `.venv/bin/`.
+
+### Windows
+
 ```powershell
 git clone https://github.com/ericboen/Recall_Accelerator_MCP.git
 cd Recall_Accelerator_MCP
@@ -16,7 +31,7 @@ python -m venv .venv
 pip install -e .
 ```
 
-That installs `recallaccelerator-mcp.exe` at `.venv\Scripts\` — the launcher each AI tool spawns.
+This installs `recallaccelerator-mcp.exe` and `racred.exe` inside `.venv\Scripts\`.
 
 ## Configure
 
@@ -35,12 +50,27 @@ Optional:
 | `RECALLACCELERATOR_TOOL_NAME` | the launcher infers | `claude-code` / `codex` / `cursor` — set explicitly if running multiple tools |
 | `RECALLACCELERATOR_CLAIMER_KIND` | `ai` | `ai` or `human` (humans get a 7-day claim lease vs 30 min for AI) |
 
-There's also a fallback config file at `%APPDATA%\RecallAccelerator\config.json` that the launcher reads if env vars aren't set, but for normal use the env-var-per-tool pattern (see below) is cleaner.
+There's also a fallback config file that the launcher reads if env vars aren't set:
+- **macOS / Linux:** `~/.config/RecallAccelerator/config.json`
+- **Windows:** `%APPDATA%\RecallAccelerator\config.json`
+
+For normal use, the env-var-per-tool pattern (see below) is cleaner.
 
 ## Wire it into your AI tool
 
 ### Claude Code
 
+#### macOS / Linux
+```bash
+claude mcp add recallaccelerator --scope user \
+  --env RECALLACCELERATOR_TOOL_NAME=claude-code \
+  --env RECALLACCELERATOR_API_KEY=ra_paste_your_key_here \
+  --env RECALLACCELERATOR_API_URL=https://your-instance.example.com \
+  --env RECALLACCELERATOR_AGENT_NAME="Your Name" \
+  -- /path/to/Recall_Accelerator_MCP/.venv/bin/recallaccelerator-mcp
+```
+
+#### Windows
 ```powershell
 claude mcp add recallaccelerator --scope user `
   --env RECALLACCELERATOR_TOOL_NAME=claude-code `
@@ -52,6 +82,19 @@ claude mcp add recallaccelerator --scope user `
 
 ### Codex (TOML config)
 
+#### macOS / Linux
+```toml
+[mcp_servers.recallaccelerator]
+command = "/path/to/Recall_Accelerator_MCP/.venv/bin/recallaccelerator-mcp"
+env = {
+  RECALLACCELERATOR_TOOL_NAME = "codex",
+  RECALLACCELERATOR_API_KEY = "ra_paste_your_key_here",
+  RECALLACCELERATOR_API_URL = "https://your-instance.example.com",
+  RECALLACCELERATOR_AGENT_NAME = "Your Name"
+}
+```
+
+#### Windows
 ```toml
 [mcp_servers.recallaccelerator]
 command = "C:\\path\\to\\Recall_Accelerator_MCP\\.venv\\Scripts\\recallaccelerator-mcp.exe"
@@ -71,6 +114,24 @@ Most read MCP config from `mcpServers` in their workspace settings. Same shape a
 
 ### Claude Desktop
 
+#### macOS / Linux
+```json
+{
+  "mcpServers": {
+    "recallaccelerator": {
+      "command": "/path/to/Recall_Accelerator_MCP/.venv/bin/recallaccelerator-mcp",
+      "env": {
+        "RECALLACCELERATOR_TOOL_NAME": "claude-desktop",
+        "RECALLACCELERATOR_API_KEY": "ra_paste_your_key_here",
+        "RECALLACCELERATOR_API_URL": "https://your-instance.example.com",
+        "RECALLACCELERATOR_AGENT_NAME": "Your Name"
+      }
+    }
+  }
+}
+```
+
+#### Windows
 ```json
 {
   "mcpServers": {
